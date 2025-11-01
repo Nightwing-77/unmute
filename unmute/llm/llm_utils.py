@@ -1,5 +1,6 @@
 import os
 import re
+import asyncio
 from copy import deepcopy
 from functools import cache
 from typing import Any, AsyncIterator, Protocol, cast
@@ -7,30 +8,22 @@ from typing import Any, AsyncIterator, Protocol, cast
 from mistralai import Mistral
 from openai import AsyncOpenAI, OpenAI
 
-from unmute.kyutai_constants import LLM_SERVER
+import google.generativeai as genai
 
+from unmute.kyutai_constants import LLM_SERVER
 from ..kyutai_constants import KYUTAI_LLM_API_KEY, KYUTAI_LLM_MODEL
 
-INTERRUPTION_CHAR = "—"  # em-dash
+INTERRUPTION_CHAR = "—"
 USER_SILENCE_MARKER = "..."
 
 
-def preprocess_messages_for_llm(
-    chat_history: list[dict[str, str]],
-) -> list[dict[str, str]]:
+def preprocess_messages_for_llm(chat_history: list[dict[str, str]]) -> list[dict[str, str]]:
     output = []
 
     for message in chat_history:
         message = deepcopy(message)
-
-        # Sometimes, an interruption happens before the LLM can say anything at all.
-        # In that case, we're left with a message with only INTERRUPTION_CHAR.
-        # Simplify by removing.
         if message["content"].replace(INTERRUPTION_CHAR, "") == "":
             continue
-
-        # If the llm was interrupted we don't want to insert the INTERRUPTION_CHAR
-        # into the context, otherwise the LLM might want to repeat it.
         message["content"] = message["content"].strip().removesuffix(INTERRUPTION_CHAR)
 
         if output and message["role"] == output[-1]["role"]:
@@ -44,8 +37,6 @@ def preprocess_messages_for_llm(
         return output[index]["role"]
 
     if role_at(0) == "system" and role_at(1) in [None, "assistant"]:
-        # Some LLMs, like Gemma, get confused if the assistant message goes before user
-        # messages, so add a dummy user message.
         output = [output[0]] + [{"role": "user", "content": "Hello."}] + output[1:]
 
     for message in chat_history:
@@ -54,31 +45,17 @@ def preprocess_messages_for_llm(
             and message["content"].startswith(USER_SILENCE_MARKER)
             and message["content"] != USER_SILENCE_MARKER
         ):
-            # This happens when the user is silent but then starts talking again after
-            # the silence marker was inserted but before the LLM could respond.
-            # There are special instructions in the system prompt about how to handle
-            # the silence marker, so remove the marker from the message to not confuse
-            # the LLM
             message["content"] = message["content"][len(USER_SILENCE_MARKER) :]
 
     return output
 
 
 async def rechunk_to_words(iterator: AsyncIterator[str]) -> AsyncIterator[str]:
-    """Rechunk the stream of text to whole words.
-
-    Otherwise the TTS doesn't know where word boundaries are and will mispronounce
-    split words.
-
-    The spaces will be included with the next word, so "foo bar baz" will be split into
-    "foo", " bar", " baz".
-    Multiple space-like characters will be merged to a single space.
-    """
     buffer = ""
     space_re = re.compile(r"\s+")
     prefix = ""
     async for delta in iterator:
-        buffer = buffer + delta
+        buffer += delta
         while True:
             match = space_re.search(buffer)
             if match is None:
@@ -93,39 +70,39 @@ async def rechunk_to_words(iterator: AsyncIterator[str]) -> AsyncIterator[str]:
         yield prefix + buffer
 
 
+# -----------------------------
+# LLM Interface Protocol
+# -----------------------------
 class LLMStream(Protocol):
-    async def chat_completion(
-        self, messages: list[dict[str, str]]
-    ) -> AsyncIterator[str]:
-        """Get a chat completion from the LLM."""
+    async def chat_completion(self, messages: list[dict[str, str]]) -> AsyncIterator[str]:
         ...
 
 
+# -----------------------------
+# Mistral
+# -----------------------------
 class MistralStream:
     def __init__(self):
-        self.current_message_index = 0
         self.mistral = Mistral(api_key=os.environ["MISTRAL_API_KEY"])
 
-    async def chat_completion(
-        self, messages: list[dict[str, str]]
-    ) -> AsyncIterator[str]:
+    async def chat_completion(self, messages: list[dict[str, str]]) -> AsyncIterator[str]:
         event_stream = await self.mistral.chat.stream_async(
             model="mistral-large-latest",
-            messages=cast(Any, messages),  # It's too annoying to type this properly
+            messages=cast(Any, messages),
             temperature=1.0,
         )
-
         async for event in event_stream:
             delta = event.data.choices[0].delta.content
-            assert isinstance(delta, str)  # make Pyright happy
-            yield delta
+            if isinstance(delta, str):
+                yield delta
 
 
+# -----------------------------
+# vLLM / OpenAI-compatible server
+# -----------------------------
 def get_openai_client(
     server_url: str = LLM_SERVER, api_key: str | None = KYUTAI_LLM_API_KEY
 ) -> AsyncOpenAI:
-    # AsyncOpenAI() will complain if the API key is not set, so set a dummy string if it's None.
-    # This still makes sense when using vLLM because it doesn't care about the API key.
     return AsyncOpenAI(api_key=api_key or "EMPTY", base_url=server_url + "/v1")
 
 
@@ -134,50 +111,74 @@ def autoselect_model() -> str:
     if KYUTAI_LLM_MODEL is not None:
         return KYUTAI_LLM_MODEL
     openai_client = get_openai_client()
-    # OpenAI() will complain if the API key is not set, so set a dummy string if it's None.
-    # This still makes sense when using vLLM because it doesn't care about the API key.
     client_sync = OpenAI(
-        api_key=openai_client.api_key or "EMPTY", base_url=openai_client.base_url
+        api_key=openai_client.api_key or "EMPTY",
+        base_url=openai_client.base_url,
     )
     models = client_sync.models.list()
     if len(models.data) != 1:
-        raise ValueError("There are multiple models available. Please specify one.")
+        raise ValueError("Multiple models available; specify one.")
     return models.data[0].id
 
 
 class VLLMStream:
-    def __init__(
-        self,
-        client: AsyncOpenAI,
-        temperature: float = 1.0,
-    ):
-        """
-        If `model` is None, it will look at the available models, and if there is only
-        one model, it will use that one. Otherwise, it will raise.
-        """
+    def __init__(self, client: AsyncOpenAI, temperature: float = 1.0):
         self.client = client
         self.model = autoselect_model()
         self.temperature = temperature
 
-    async def chat_completion(
-        self, messages: list[dict[str, str]]
-    ) -> AsyncIterator[str]:
+    async def chat_completion(self, messages: list[dict[str, str]]) -> AsyncIterator[str]:
         stream = await self.client.chat.completions.create(
             model=self.model,
-            messages=cast(Any, messages),  # Cast and hope for the best
+            messages=cast(Any, messages),
             stream=True,
             temperature=self.temperature,
         )
-
         async with stream:
             async for chunk in stream:
-                chunk_content = chunk.choices[0].delta.content
+                delta = chunk.choices[0].delta.content
+                if delta:
+                    yield delta
 
-                if not chunk_content:
-                    # This happens on the first message, see:
-                    # https://platform.openai.com/docs/guides/streaming-responses#read-the-responses
-                    # Also ignore `null` chunks, which is what llama.cpp does:
-                    # https://github.com/ggml-org/llama.cpp/blob/6491d6e4f1caf0ad2221865b4249ae6938a6308c/tools/server/tests/unit/test_chat_completion.py#L338
-                    continue
 
-                yield chunk_content
+# -----------------------------
+# Gemini (Google)
+# -----------------------------
+class GeminiStream:
+    def __init__(self, model_name: str = "gemini-1.5-pro", temperature: float = 1.0):
+        api_key = os.environ.get("GEMINI_API_KEY")
+        if not api_key:
+            raise ValueError("Missing GEMINI_API_KEY environment variable.")
+        genai.configure(api_key=api_key)
+        self.model = genai.GenerativeModel(model_name)
+        self.temperature = temperature
+
+    async def chat_completion(self, messages: list[dict[str, str]]) -> AsyncIterator[str]:
+        """Stream response text from Gemini model asynchronously."""
+        # Convert chat messages to one string prompt (Gemini doesn’t use roles directly)
+        prompt = ""
+        for m in messages:
+            role = m["role"]
+            if role == "system":
+                prompt += f"[System]: {m['content']}\n"
+            elif role == "assistant":
+                prompt += f"[Assistant]: {m['content']}\n"
+            elif role == "user":
+                prompt += f"[User]: {m['content']}\n"
+
+        # Gemini’s SDK is not async, so run it in a thread
+        loop = asyncio.get_event_loop()
+
+        def _sync_stream():
+            return self.model.generate_content(
+                prompt,
+                stream=True,
+                generation_config={"temperature": self.temperature},
+            )
+
+        stream = await loop.run_in_executor(None, _sync_stream)
+
+        for chunk in stream:
+            if chunk and hasattr(chunk, "text") and chunk.text:
+                yield chunk.text
+            await asyncio.sleep(0)  # allow event loop to breathe
